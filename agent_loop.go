@@ -298,7 +298,8 @@ func loadConfig() (config, error) {
 		APIKey:  apiKey,
 		Model:   model,
 
-		System: fmt.Sprintf("You are a coding agent at %s. Use bash to solve tasks. Act, don't explain.", wd),
+		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.",
+			wd),
 		Client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
@@ -550,6 +551,11 @@ func contentText(content any) string {
 }
 
 func agentLoop(cfg config, history *[]apiMessage) (string, error) {
+	// roundsSinceTodo 用来记录连续多少轮没有使用 todo 工具了。
+	// 如果连续多轮都没有使用了，说明模型可能已经忘记了这个工具的存在了
+	// reminder提醒模型使用 todo 工具来规划和跟踪任务进度
+	roundsSinceTodo := 0
+
 	for {
 		response, err := createChatCompletion(cfg, *history)
 		if err != nil {
@@ -581,6 +587,8 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 			ToolCalls: message.ToolCalls,
 		})
 
+		// 记录本轮是否使用了 todo 工具，如果连续多轮都没有使用 todo 工具，说明模型可能已经忘记了这个工具的存在了
+		usedTodo := false
 		// 依次执行模型请求的工具调用，把结果一条条加到 history 里
 		for _, call := range message.ToolCalls {
 			output := runToolCall(call)
@@ -589,7 +597,24 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 				Content:    output,
 				ToolCallID: call.ID,
 			})
+			if call.Function.Name == "todo" {
+				usedTodo = true
+			}
 			// fmt.Printf("\033[36m[Tool call '%s' output]:\n%s\n\033[0m\n", call.Function.Name, truncateText(output, maxPreviewRunes))
+		}
+
+		if usedTodo {
+			roundsSinceTodo = 0
+		} else {
+			roundsSinceTodo++
+		}
+
+		// 下一轮该更新 todo 了
+		if roundsSinceTodo >= 3 {
+			*history = append(*history, apiMessage{
+				Role:    "user",
+				Content: "<reminder>Update your todos.</reminder>",
+			})
 		}
 	}
 }
