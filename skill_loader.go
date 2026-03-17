@@ -53,6 +53,9 @@ func (l *SkillLoader) loadAll() error {
 		meta, body := parseFrontmatter(string(data))
 		// skill name
 		name := strings.TrimSpace(meta["name"])
+		if name == "" {
+			name = filepath.Base(filepath.Dir(path))
+		}
 		l.Skills[name] = Skill{
 			Meta: meta,
 			Body: body,
