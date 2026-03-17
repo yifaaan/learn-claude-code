@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type Skill struct {
@@ -49,13 +50,46 @@ func (l *SkillLoader) loadAll() error {
 			return err
 		}
 
+		meta, body := parseFrontmatter(string(data))
 		// skill name
-		name := filepath.Base(filepath.Dir(path))
+		name := strings.TrimSpace(meta["name"])
 		l.Skills[name] = Skill{
-			Meta: make(map[string]string),
-			Body: string(data),
+			Meta: meta,
+			Body: body,
 			Path: path,
 		}
 	}
 	return nil
+}
+
+func parseFrontmatter(text string) (map[string]string, string) {
+	meta := map[string]string{}
+
+	if !strings.HasPrefix(text, "---\n") {
+		return meta, strings.TrimSpace(text)
+	}
+
+	rest := strings.TrimPrefix(text, "---\n")
+	idx := strings.Index(rest, "\n---\n")
+	if idx == -1 {
+		return meta, strings.TrimSpace(text)
+	}
+
+	header := rest[:idx]
+	body := rest[idx+5:]
+
+	for _, rawLine := range strings.Split(header, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+
+		meta[strings.TrimSpace(key)] = strings.TrimSpace(val)
+	}
+	return meta, strings.TrimSpace(body)
 }
