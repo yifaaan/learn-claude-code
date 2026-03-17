@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -254,7 +256,7 @@ func loadDotEnv(path string) error {
 // 6. 如果接口报错，返回可读的错误信息
 func createChatCompletion(cfg config, history []apiMessage) (chatResponse, error) {
 	messages := make([]apiMessage, 0, len(history)+2)
-	message = append(messages, apiMessage{
+	messages = append(messages, apiMessage{
 		Role:    "system",
 		Content: cfg.System,
 	})
@@ -310,4 +312,150 @@ func createChatCompletion(cfg config, history []apiMessage) (chatResponse, error
 		)
 	}
 	return parsed, nil
+}
+
+// runToolCall 负责执行模型请求的单个工具调用。
+//
+// 它并不直接“理解业务”，只做三件事：
+// 1. 校验工具类型和工具名
+// 2. 解析 arguments JSON
+// 3. 调用 runBash() 执行命令
+func runToolCall(call toolCall) string {
+	if call.Type != "function" {
+		return fmt.Sprintf("unsupported tool call type: %s", call.Type)
+	}
+
+	// 目前只支持 bash 工具，如果模型请求了其他工具，直接返回错误信息
+	if call.Function.Name != toolName {
+		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
+	}
+
+	// 解析模型传入的参数。对于 function 类型的工具调用，参数是一个 JSON 字符串，包含在 call.Function.Arguments 字段里。
+	var input bashToolInput
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+		return fmt.Sprintf("invalid tool arguments: %v", err)
+	}
+
+	fmt.Printf("\033[33m$ %s\033[0m\n", input.Command)
+
+	output := runBash(input.Command)
+	fmt.Println(truncateText(output, maxPreviewRunes))
+	return output
+}
+
+func runBash(command string) string {
+	lower := strings.ToLower(command)
+
+	for _, fragment := range dangerouseFraments {
+		if strings.Contains(lower, strings.ToLower(fragment)) {
+			return fmt.Sprintf("command contains dangerous fragment '%s', refusing to execute", fragment)
+		}
+	}
+
+	// 超时
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "powershell", "-Command", command)
+	cmd.Dir = mustGetwd()
+
+	output, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return "Error: command timed out"
+	}
+
+	text := strings.TrimSpace(string(output))
+
+	if err != nil && text == "" {
+		text = err.Error()
+	}
+
+	if text == "" {
+		text = "(no output)"
+	}
+
+	return truncateText(text, maxToolOutputRunes)
+}
+
+// mustGetwd 提供一个“获取当前目录”的兜底实现。
+// 正常情况下 os.Getwd() 不会失败；如果失败，就退回 "."。
+func mustGetwd() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return wd
+}
+
+// truncateText 按 rune 截断字符串，避免直接按字节截断中文导致乱码。
+func truncateText(input string, limit int) string {
+	runes := []rune(input)
+	if len(runes) <= limit {
+		return input
+	}
+	return string(runes[:limit])
+}
+
+// contentText 用来把模型返回的 content 安全地转换成字符串。
+//
+// 前面把 responseMessage.Content / apiMessage.Content 定义成了 any，
+func contentText(content any) string {
+	switch value := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	default:
+		data, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Sprintf("failed to marshal content: %v", err)
+		}
+		return string(data)
+	}
+}
+
+func agentLoop(cfg config, history *[]apiMessage) (string, error) {
+	for {
+		response, err := createChatCompletion(cfg, *history)
+		if err != nil {
+			return "", err
+		}
+
+		if len(response.Choices) == 0 {
+			return "", fmt.Errorf("no choices in response")
+		}
+
+		message := response.Choices[0].Message
+
+		// 本轮模型回复里没有工具调用了，说明模型认为自己已经完成了任务，可以停止了
+		if len(message.ToolCalls) == 0 {
+			reply := contentText(message.Content)
+
+			// 把模型的最终回复也加到 history 里
+			*history = append(*history, apiMessage{
+				Role:    "assistant",
+				Content: reply,
+			})
+			return reply, nil
+		}
+
+		// 模型请求了工具调用，先把这条消息加到 history 里（包含工具调用信息）
+		*history = append(*history, apiMessage{
+			Role:      "assistant",
+			Content:   contentText(message.Content),
+			ToolCalls: message.ToolCalls,
+		})
+
+		// 依次执行模型请求的工具调用，把结果一条条加到 history 里
+		for _, call := range message.ToolCalls {
+			output := runToolCall(call)
+			*history = append(*history, apiMessage{
+				Role:       "tool",
+				Content:    output,
+				ToolCallID: call.ID,
+			})
+			// fmt.Printf("\033[36m[Tool call '%s' output]:\n%s\n\033[0m\n", call.Function.Name, truncateText(output, maxPreviewRunes))
+		}
+	}
 }
