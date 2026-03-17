@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -61,11 +59,12 @@ type bashToolInput struct {
 }
 
 type config struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	System  string
-	Client  *http.Client
+	BaseURL        string
+	APIKey         string
+	Model          string
+	System         string
+	SubagentSystem string
+	Client         *http.Client
 }
 
 // apiMessage 表示一条对话消息。
@@ -160,7 +159,15 @@ type apiError struct {
 // toolDefinitions 返回我声明给模型的工具列表
 // 把工具的名字、描述、参数 schema
 // 告诉模型，让模型知道自己可以发起什么样的 tool call
-func toolDefinitions() []toolSpec {
+// func toolDefinitions() []toolSpec {
+
+// }
+
+// - bash
+// - read_file
+// - write_file
+// - edit_file
+func baseToolDefinitions() []toolSpec {
 	return []toolSpec{
 		{
 			Type: "function",
@@ -238,39 +245,70 @@ func toolDefinitions() []toolSpec {
 				},
 			},
 		},
-		{
-			Type: "function",
-			Function: toolFunction{
-				Name:        "todo",
-				Description: "Update task list. Track progress on multi-step tasks.",
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
+	}
+}
+func childToolDefinitions() []toolSpec {
+	return baseToolDefinitions()
+}
+
+// base + todo + task
+func parentToolDefinitions() []toolSpec {
+	tools := append([]toolSpec{}, childToolDefinitions()...)
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "todo",
+			Description: "Update task list. Track progress on multi-step tasks.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"items": map[string]any{
+						"type": "array",
 						"items": map[string]any{
-							"type": "array",
-							"items": map[string]any{
-								"type": "object",
-								"properties": map[string]any{
-									"id": map[string]any{
-										"type": "string",
-									},
-									"text": map[string]any{
-										"type": "string",
-									},
-									"status": map[string]any{
-										"type": "string",
-										"enum": []string{"pending", "in_progress", "completed"},
-									},
+							"type": "object",
+							"properties": map[string]any{
+								"id": map[string]any{
+									"type": "string",
 								},
-								"required": []string{"id", "text", "status"},
+								"text": map[string]any{
+									"type": "string",
+								},
+								"status": map[string]any{
+									"type": "string",
+									"enum": []string{"pending", "in_progress", "completed"},
+								},
 							},
+							"required": []string{"id", "text", "status"},
 						},
 					},
-					"required": []string{"items"},
 				},
+				"required": []string{"items"},
 			},
 		},
-	}
+	})
+
+	// task，用来创建子 agent
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "task",
+			Description: "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"prompt": map[string]any{
+						"type": "string",
+					},
+					"description": map[string]any{
+						"type":        "string",
+						"description": "Short description of the task.",
+					},
+				},
+				"required": []string{"prompt"},
+			},
+		},
+	})
+	return tools
 }
 func loadConfig() (config, error) {
 	wd, err := os.Getwd()
@@ -299,6 +337,9 @@ func loadConfig() (config, error) {
 		Model:   model,
 
 		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.",
+			wd),
+		SubagentSystem: fmt.Sprintf(
+			"You are a coding subagent at %s. Complete the given task, then summarize your findings.",
 			wd),
 		Client: &http.Client{
 			Timeout: 5 * time.Minute,
@@ -351,63 +392,7 @@ func loadDotEnv(path string) error {
 // 5. 读取并解析响应
 // 6. 如果接口报错，返回可读的错误信息
 func createChatCompletion(cfg config, history []apiMessage) (chatResponse, error) {
-	messages := make([]apiMessage, 0, len(history)+2)
-	messages = append(messages, apiMessage{
-		Role:    "system",
-		Content: cfg.System,
-	})
-	messages = append(messages, history...)
-
-	reqBody, err := json.Marshal(chatRequest{
-		Model:    cfg.Model,
-		Messages: messages,
-		Tools:    toolDefinitions(),
-	})
-	if err != nil {
-		return chatResponse{}, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		cfg.BaseURL+"/chat/completions",
-		bytes.NewReader(reqBody),
-	)
-	if err != nil {
-		return chatResponse{}, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-
-	resp, err := cfg.Client.Do(req)
-	if err != nil {
-		return chatResponse{}, fmt.Errorf("request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return chatResponse{}, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var parsed chatResponse
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return chatResponse{}, fmt.Errorf("failed to parse response body: %w\nResponse body: %s", err, string(respBody))
-	}
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		if parsed.Error != nil && parsed.Error.Message != "" {
-			return chatResponse{}, fmt.Errorf("API error: %s", parsed.Error.Message)
-		}
-
-		// 返回的不是标准 error 结构，就把原始 body 截断后带出来。
-		return chatResponse{}, fmt.Errorf(
-			"qwen api error: status %d: %s",
-			resp.StatusCode,
-			truncateText(string(respBody), 1000),
-		)
-	}
-	return parsed, nil
+	return createChatCompletionWithTools(cfg, cfg.System, history, parentToolDefinitions())
 }
 
 // runToolCall 负责执行模型请求的单个工具调用。
@@ -416,7 +401,7 @@ func createChatCompletion(cfg config, history []apiMessage) (chatResponse, error
 // 1. 校验工具类型和工具名
 // 2. 解析 arguments JSON
 // 3. 调用 runBash() 执行命令
-func runToolCall(call toolCall) string {
+func runToolCall(cfg config, call toolCall) string {
 	if call.Type != "function" {
 		return fmt.Sprintf("unsupported tool call type: %s", call.Type)
 	}
@@ -473,6 +458,26 @@ func runToolCall(call toolCall) string {
 		}
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
+
+	case "task": // 这个工具会创建一个子 agent 来完成任务
+		var input taskInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		desc := strings.TrimSpace(input.Description)
+		if desc == "" {
+			desc = "subtask"
+		}
+		fmt.Printf("> task (%s): %s\n", desc, truncateText(input.Prompt, 80))
+
+		output, err := runSubagent(cfg, input.Prompt)
+		if err != nil {
+			return fmt.Sprintf("failed to run subagent: %v", err)
+		}
+
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
 	default:
 		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}
@@ -591,7 +596,7 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 		usedTodo := false
 		// 依次执行模型请求的工具调用，把结果一条条加到 history 里
 		for _, call := range message.ToolCalls {
-			output := runToolCall(call)
+			output := runToolCall(cfg, call)
 			*history = append(*history, apiMessage{
 				Role:       "tool",
 				Content:    output,
