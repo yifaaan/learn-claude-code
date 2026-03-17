@@ -52,6 +52,9 @@ var dangerouseFraments = []string{
 	"> /dev/",
 }
 
+// 全局任务状态实例
+var todoState = &todoManager{}
+
 // bashToolInput 是传递给 bash 工具的输入参数结构
 type bashToolInput struct {
 	Command string `json:"command"`
@@ -232,6 +235,38 @@ func toolDefinitions() []toolSpec {
 						},
 					},
 					"required": []string{"path", "old_text", "new_text"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: toolFunction{
+				Name:        "todo",
+				Description: "Update task list. Track progress on multi-step tasks.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"items": map[string]any{
+							"type": "array",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"id": map[string]any{
+										"type": "string",
+									},
+									"text": map[string]any{
+										"type": "string",
+									},
+									"status": map[string]any{
+										"type": "string",
+										"enum": []string{"pending", "in_progress", "completed"},
+									},
+								},
+								"required": []string{"id", "text", "status"},
+							},
+						},
+					},
+					"required": []string{"items"},
 				},
 			},
 		},
@@ -425,6 +460,18 @@ func runToolCall(call toolCall) string {
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
 
+	case "todo":
+		var input todoInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		output, err := todoState.Update(input.Items)
+		if err != nil {
+			return fmt.Sprintf("failed to update todo list: %v", err)
+		}
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
 	default:
 		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}
