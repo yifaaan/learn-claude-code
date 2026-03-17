@@ -162,7 +162,7 @@ func toolDefinitions() []toolSpec {
 		{
 			Type: "function",
 			Function: toolFunction{
-				Name:        toolName,
+				Name:        "bash",
 				Description: "Run a shell command.",
 				Parameters: map[string]any{
 					"type": "object",
@@ -172,6 +172,66 @@ func toolDefinitions() []toolSpec {
 						},
 					},
 					"required": []string{"command"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: toolFunction{
+				Name:        "read_file",
+				Description: "Read file contents.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{
+							"type": "string",
+						},
+						"limit": map[string]any{
+							"type": "integer",
+						},
+					},
+					"required": []string{"path"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: toolFunction{
+				Name:        "write_file",
+				Description: "Write content to file.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{
+							"type": "string",
+						},
+						"content": map[string]any{
+							"type": "string",
+						},
+					},
+					"required": []string{"path", "content"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: toolFunction{
+				Name:        "edit_file",
+				Description: "Replace exact text in file.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{
+							"type": "string",
+						},
+						"old_text": map[string]any{
+							"type": "string",
+						},
+						"new_text": map[string]any{
+							"type": "string",
+						},
+					},
+					"required": []string{"path", "old_text", "new_text"},
 				},
 			},
 		},
@@ -325,22 +385,49 @@ func runToolCall(call toolCall) string {
 		return fmt.Sprintf("unsupported tool call type: %s", call.Type)
 	}
 
-	// 目前只支持 bash 工具，如果模型请求了其他工具，直接返回错误信息
-	if call.Function.Name != toolName {
-		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
-	}
+	fmt.Printf("\033[33m> %s\033[0m\n", call.Function.Name)
 
 	// 解析模型传入的参数。对于 function 类型的工具调用，参数是一个 JSON 字符串，包含在 call.Function.Arguments 字段里。
-	var input bashToolInput
-	if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
-		return fmt.Sprintf("invalid tool arguments: %v", err)
+	switch call.Function.Name {
+	case "bash":
+		var input bashToolInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		output := runBash(input.Command)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "read_file":
+		var input readFileInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		output := runRead(input.Path, input.Limit)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "write_file":
+		var input writeFileInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		output := runWrite(input.Path, input.Content)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "edit_file":
+		var input editFileInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		output := runEdit(input.Path, input.OldText, input.NewText)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	default:
+		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}
-
-	fmt.Printf("\033[33m$ %s\033[0m\n", input.Command)
-
-	output := runBash(input.Command)
-	fmt.Println(truncateText(output, maxPreviewRunes))
-	return output
 }
 
 func runBash(command string) string {
