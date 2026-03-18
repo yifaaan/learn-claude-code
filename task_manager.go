@@ -25,6 +25,22 @@ type Task struct {
 	Owner       string `json:"owner"`      // 任务负责人agent的名字
 }
 
+type taskCreateInput struct {
+	Subject     string `json:"subject"`
+	Description string `json:"description"`
+}
+
+type taskUpdateInput struct {
+	ID           int    `json:"id"`
+	Status       string `json:"status,omitempty"`
+	AddBlockedBy []int  `json:"add_blocked_by,omitempty"`
+	AddBlocks    []int  `json:"add_blocks,omitempty"`
+}
+
+type taskGetInput struct {
+	ID int `json:"id"`
+}
+
 type TaskManager struct {
 	dir    string // task_*.json文件所在目录
 	nextID int    // 下一个可用任务ID

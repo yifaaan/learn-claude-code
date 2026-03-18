@@ -54,6 +54,8 @@ var dangerouseFraments = []string{
 // 全局任务状态实例
 var todoState = &todoManager{}
 
+var taskManager = NewTaskManager(filepath.Join(mustGetwd(), "tasks"))
+
 // bashToolInput 是传递给 bash 工具的输入参数结构
 type bashToolInput struct {
 	Command string `json:"command"`
@@ -345,8 +347,90 @@ func parentToolDefinitions() []toolSpec {
 			},
 		},
 	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "task_create",
+			Description: "Create a new task.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"subject": map[string]any{
+						"type": "string",
+					},
+					"description": map[string]any{
+						"type": "string",
+					},
+				},
+				"required": []string{"subject", "description"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "task_update",
+			Description: "Update task status or dependencies.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{
+						"type": "integer",
+					},
+					"status": map[string]any{
+						"type": "string",
+						"enum": []string{"pending", "in_progress", "completed"},
+					},
+					"add_blocked_by": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "integer",
+						},
+					},
+					"add_blocks": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "integer",
+						},
+					},
+				},
+				"required": []string{"id"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "task_list",
+			Description: "List all tasks.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	})
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "task_get",
+			Description: "Get a specific task.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{
+						"type": "integer",
+					},
+				},
+				"required": []string{"id"},
+			},
+		},
+	})
 	return tools
 }
+
 func loadConfig() (config, error) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -536,6 +620,57 @@ func runToolCall(cfg config, call toolCall) string {
 
 		fmt.Printf("> load_skill: %s\n", strings.TrimSpace(input.Name))
 		output := cfg.Skills.Content(strings.TrimSpace(input.Name))
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "task_create":
+		var input taskCreateInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		task, err := taskManager.Create(input.Subject, input.Description)
+		if err != nil {
+			return fmt.Sprintf("failed to create task: %v", err)
+		}
+		output := fmt.Sprintf("Created task #%d: %s - %s", task.ID, task.Subject, task.Description)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "task_update":
+		var input taskUpdateInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		params := UpdateParams{
+			Status:       input.Status,
+			AddBlockedBy: input.AddBlockedBy,
+			AddBlocks:    input.AddBlocks,
+		}
+		task, err := taskManager.Update(input.ID, params)
+		if err != nil {
+			return fmt.Sprintf("failed to update task: %v", err)
+		}
+		output := fmt.Sprintf("Updated task #%d: status=%s, blocked_by=%v, blocks=%v", task.ID, task.Status, task.BlockedBy, task.Blocks)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "task_list":
+		output := taskManager.ListAll()
+		fmt.Println(output)
+		return output
+
+	case "task_get":
+		var input struct {
+			ID int `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+		task, err := taskManager.Get(input.ID)
+		if err != nil {
+			return fmt.Sprintf("failed to get task: %v", err)
+		}
+		output := fmt.Sprintf("Task #%d: %s - %s (status=%s, blocked_by=%v, blocks=%v, owner=%s)", task.ID, task.Subject, task.Description, task.Status, task.BlockedBy, task.Blocks, task.Owner)
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
 	default:
