@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -95,4 +96,50 @@ func parseFrontmatter(text string) (map[string]string, string) {
 		meta[strings.TrimSpace(key)] = strings.TrimSpace(val)
 	}
 	return meta, strings.TrimSpace(body)
+}
+
+func (l *SkillLoader) Descriptions() string {
+	if len(l.Skills) == 0 {
+		return "(no skills available)"
+	}
+
+	names := make([]string, 0, len(l.Skills))
+	for name := range l.Skills {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	lines := make([]string, 0, len(names))
+	for _, name := range names {
+		skill := l.Skills[name]
+		desc := skill.Meta["description"]
+		if desc == "" {
+			desc = "No description"
+		}
+		tags := strings.TrimSpace(skill.Meta["tags"])
+		line := fmt.Sprintf("  - %s: %s", name, desc)
+		if tags != "" {
+			line += fmt.Sprintf(" [%s]", tags)
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (l *SkillLoader) Content(name string) string {
+	skill, ok := l.Skills[name]
+	if !ok {
+		names := make([]string, 0, len(l.Skills))
+		for n := range l.Skills {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+
+		return fmt.Sprintf(
+			"Error: Unknown skill %q. Available: %s",
+			name,
+			strings.Join(names, ", "),
+		)
+	}
+	return fmt.Sprintf("<skill name=%q>\n%s\n</skill>", name, skill.Body)
 }
