@@ -606,6 +606,17 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 	roundsSinceTodo := 0
 
 	for {
+		// 每轮对话开始前都做一次 compact，去掉历史消息里不必要的内容，保持对话历史的精简和相关，可以让模型更好地理解上下文，提升性能。
+		microCompact(*history)
+
+		if estimateTokens(*history) > compactThreshold {
+			fmt.Println("[auto_compact triggered]")
+			compacted, err := autoCompact(cfg, *history, "")
+			if err != nil {
+				return "", err
+			}
+			*history = compacted
+		}
 		response, err := createChatCompletion(cfg, *history)
 		if err != nil {
 			return "", err
