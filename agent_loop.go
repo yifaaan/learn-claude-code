@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -64,6 +65,7 @@ type config struct {
 	Model          string
 	System         string
 	SubagentSystem string
+	Skills         *SkillLoader
 	Client         *http.Client
 }
 
@@ -331,16 +333,23 @@ func loadConfig() (config, error) {
 		model = "qwen3.5-plus"
 	}
 
+	skillsDir := filepath.Join(wd, "skills")
+	skills, err := NewSkillLoader(skillsDir)
+	if err != nil {
+		return config{}, fmt.Errorf("failed to load skills: %v", err)
+	}
+
 	return config{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		Model:   model,
 
-		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.",
-			wd),
+		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
+			wd, skills.Descriptions()),
 		SubagentSystem: fmt.Sprintf(
-			"You are a coding subagent at %s. Complete the given task, then summarize your findings.",
-			wd),
+			"You are a coding subagent at %s. Complete the given task, then summarize your findings.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
+			wd, skills.Descriptions()),
+		Skills: skills,
 		Client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
