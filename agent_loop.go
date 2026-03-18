@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,7 +55,138 @@ var dangerouseFraments = []string{
 // 全局任务状态实例
 var todoState = &todoManager{}
 
+// 持久化的任务管理器，存储在当前目录下的 tasks 文件夹里
 var taskManager = NewTaskManager(filepath.Join(mustGetwd(), "tasks"))
+
+// 全局后台任务管理器，允许模型在后台并发执行任务，并在下一轮对话开始前把结果注入到对话里
+var backgroundManager = NewBackgroundManager()
+
+// BackgroundTask 表示一个正在后台运行或已经结束的任务
+type BackgroundTask struct {
+	ID      string // 任务 ID，可以用来查询任务状态
+	Command string // 任务执行的命令
+	Status  string // running / completed / failed / error
+	Result  string // 任务执行结果的简要描述
+}
+
+// BackgroundNotification 表示“需要在下一轮 LLM 调用前注入”的通知
+// 一次性的，注入后就不再保留了
+type BackgroundNotification struct {
+	ID      string
+	Status  string
+	Command string
+	Result  string
+}
+
+// BackgroundManager 负责并发安全地管理后台任务。
+// mutex：
+// - 主 goroutine 会查任务、取通知
+// - 后台 goroutine 会写任务结果、塞通知
+// 这两个方向会并发访问同一个 map / slice
+type BackgroundManager struct {
+	mu sync.Mutex
+
+	nextID int
+	tasks  map[string]*BackgroundTask
+
+	// notifications 是“需要在下一轮 LLM 调用前注入”的通知列表
+	notifications []BackgroundNotification
+}
+
+// NewBackgroundManager 初始化内存态后台任务管理器
+func NewBackgroundManager() *BackgroundManager {
+	return &BackgroundManager{
+		tasks:         make(map[string]*BackgroundTask),
+		notifications: make([]BackgroundNotification, 0, 4),
+	}
+}
+
+// Start 返回 taskID， 同时在后台 goroutine 里执行 runner
+// manager 不关心 runner 是什么，只负责管理任务状态和通知
+func (m *BackgroundManager) Start(command string, runner func(string) (string, string)) string {
+	m.mu.Lock()
+
+	m.nextID++
+	// 生成一个唯一的 taskID，格式是 "bg-0001", "bg-0002"
+	taskID := fmt.Sprintf("bg-%04d", m.nextID)
+
+	m.tasks[taskID] = &BackgroundTask{
+		ID:      taskID,
+		Command: command,
+		Status:  "running",
+		Result:  "",
+	}
+
+	m.mu.Unlock()
+
+	go func() {
+		status, result := runner(command)
+
+		if strings.TrimSpace(result) == "" {
+			result = "(no output)"
+		}
+
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		// 更新任务执行后的状态
+		task := m.tasks[taskID]
+		task.Status = status
+		task.Result = result
+
+		// 把这个结果塞到 notifications 里，等下一轮 LLM 调用前注入到对话里
+		m.notifications = append(m.notifications, BackgroundNotification{
+			ID:      taskID,
+			Status:  status,
+			Command: truncateText(command, 80),
+			Result:  truncateText(result, 500),
+		})
+	}()
+
+	return taskID
+}
+
+// DrainNotifications 返回当前所有待投递通知，并立即清空队列
+func (m *BackgroundManager) DrainNotifications() []BackgroundNotification {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]BackgroundNotification, len(m.notifications))
+	copy(out, m.notifications)
+	m.notifications = m.notifications[:0] // 清空队列
+	return out
+}
+
+// Check 查询单个后台任务：如果 taskID 为空，列出所有任务
+func (m *BackgroundManager) Check(taskID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if strings.TrimSpace(taskID) != "" {
+		task, ok := m.tasks[taskID]
+		if !ok {
+			return fmt.Sprintf("unknown background task: %s", taskID)
+		}
+
+		result := task.Result
+		if strings.TrimSpace(result) == "" {
+			result = "no output"
+		}
+
+		return fmt.Sprintf("[%s] %s\n%s", task.Status, truncateText(task.Command, 60), result)
+	}
+
+	if len(m.tasks) == 0 {
+		return "no background tasks"
+	}
+
+	lines := make([]string, 0, len(m.tasks))
+	for id, task := range m.tasks {
+		lines = append(lines, fmt.Sprintf("%s: [%s] %s", id, task.Status, truncateText(task.Command, 60)))
+	}
+
+	return strings.Join(lines, "\n")
+}
 
 // bashToolInput 是传递给 bash 工具的输入参数结构
 type bashToolInput struct {
