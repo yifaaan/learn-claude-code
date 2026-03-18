@@ -24,7 +24,7 @@ func main() {
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 
 	for {
-		fmt.Print("\033[36ms01 >> \033[0m")
+		fmt.Print("\033[36ms06 >> \033[0m")
 		if !scanner.Scan() {
 			break
 		}

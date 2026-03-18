@@ -9,3 +9,4 @@ dist/
 *.out
 
 coverage.out
+.transcripts

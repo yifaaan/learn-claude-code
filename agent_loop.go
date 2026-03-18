@@ -269,6 +269,22 @@ func childToolDefinitions() []toolSpec {
 			},
 		},
 	})
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "compact",
+			Description: "Trigger manul conversation compression",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"focus": map[string]any{
+						"type":        "string",
+						"description": "What to preserve in the summary.",
+					},
+				},
+			},
+		},
+	})
 	return tools
 }
 
@@ -649,9 +665,30 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 
 		// 记录本轮是否使用了 todo 工具，如果连续多轮都没有使用 todo 工具，说明模型可能已经忘记了这个工具的存在了
 		usedTodo := false
+
+		// 手动指定了压缩
+		manualCompact := false
+		manualCompactFocus := ""
+
 		// 依次执行模型请求的工具调用，把结果一条条加到 history 里
 		for _, call := range message.ToolCalls {
-			output := runToolCall(cfg, call)
+			var output string
+			// 如果工具调用是 compact，就不直接执行压缩，而是设置一个标记，等这个循环结束后再统一压缩一次。这样做的好处是，如果模型连续调用了多次工具，每次都触发一次压缩，可能会导致过度压缩，把重要信息也压缩掉了。等循环结束后再根据最后一次调用的 focus 来决定怎么压缩，可以更好地保留重要信息。
+			if call.Function.Name == "compact" {
+				manualCompact = true
+
+				var input compactInput
+				if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+					output = fmt.Sprintf("invalid tool arguments: %v", err)
+				} else {
+					manualCompactFocus = input.Focus
+					output = "Compressing..."
+				}
+				fmt.Println(truncateText(output, maxPreviewRunes))
+			} else {
+				output = runToolCall(cfg, call)
+			}
+
 			*history = append(*history, apiMessage{
 				Role:       "tool",
 				Content:    output,
@@ -661,6 +698,15 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 				usedTodo = true
 			}
 			// fmt.Printf("\033[36m[Tool call '%s' output]:\n%s\n\033[0m\n", call.Function.Name, truncateText(output, maxPreviewRunes))
+		}
+
+		if manualCompact {
+			fmt.Println("[manual compact]")
+			compacted, err := autoCompact(cfg, *history, manualCompactFocus)
+			if err != nil {
+				return "", fmt.Errorf("failed to compact conversation: %v", err)
+			}
+			*history = compacted
 		}
 
 		if usedTodo {
