@@ -169,6 +169,7 @@ type apiError struct {
 // - read_file
 // - write_file
 // - edit_file
+// - load_skill
 func baseToolDefinitions() []toolSpec {
 	return []toolSpec{
 		{
@@ -250,7 +251,25 @@ func baseToolDefinitions() []toolSpec {
 	}
 }
 func childToolDefinitions() []toolSpec {
-	return baseToolDefinitions()
+	tools := append([]toolSpec{}, baseToolDefinitions()...)
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "load_skill",
+			Description: "Load specialized knowledge by name.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Skill name to load",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+	})
+	return tools
 }
 
 // base + todo + task
@@ -487,6 +506,22 @@ func runToolCall(cfg config, call toolCall) string {
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
 
+	case "load_skill":
+		var input struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		if cfg.Skills == nil {
+			return "skill loader not configured"
+		}
+
+		fmt.Printf("> load_skill: %s\n", strings.TrimSpace(input.Name))
+		output := cfg.Skills.Content(strings.TrimSpace(input.Name))
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
 	default:
 		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}
