@@ -68,21 +68,27 @@ func (l *SkillLoader) loadAll() error {
 
 func parseFrontmatter(text string) (map[string]string, string) {
 	meta := map[string]string{}
+	normalized := strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
 
-	if !strings.HasPrefix(text, "---\n") {
-		return meta, strings.TrimSpace(text)
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return meta, strings.TrimSpace(normalized)
 	}
 
-	rest := strings.TrimPrefix(text, "---\n")
-	idx := strings.Index(rest, "\n---\n")
-	if idx == -1 {
-		return meta, strings.TrimSpace(text)
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			end = i
+			break
+		}
 	}
+	if end == -1 {
+		return meta, strings.TrimSpace(normalized)
+	}
+	header := lines[1:end]
+	body := strings.Join(lines[end+1:], "\n")
 
-	header := rest[:idx]
-	body := rest[idx+5:]
-
-	for _, rawLine := range strings.Split(header, "\n") {
+	for _, rawLine := range header {
 		line := strings.TrimSpace(rawLine)
 		if line == "" {
 			continue
