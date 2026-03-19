@@ -58,6 +58,12 @@ var todoState = &todoManager{}
 // Persistent task manager backed by files in the local tasks directory.
 var taskManager = NewTaskManager(filepath.Join(mustGetwd(), "tasks"))
 
+// Persistent team state backed by .team/config.json and .team/inbox/*.jsonl.
+var teamBus = NewMessageBus(filepath.Join(mustGetwd(), ".team", "inbox"))
+
+// Global teammate manager for persistent named teammates.
+var teammateManager = NewTeammateManager(filepath.Join(mustGetwd(), ".team"), teamBus)
+
 // Global background task manager for asynchronous command execution.
 var backgroundManager = NewBackgroundManager()
 
@@ -191,6 +197,18 @@ type backgroundRunInput struct {
 // checkBackgroundInput is the JSON payload accepted by check_background.
 type checkBackgroundInput struct {
 	TaskID string `json:"task_id,omitempty"`
+}
+
+type spawnTeammateInput struct {
+	Name   string `json:"name"`
+	Role   string `json:"role"`
+	Prompt string `json:"prompt"`
+}
+
+type sendMessageInput struct {
+	To      string `json:"to"`
+	Content string `json:"content"`
+	MsgType string `json:"msg_type,omitempty"`
 }
 
 type config struct {
@@ -560,6 +578,94 @@ func parentToolDefinitions() []toolSpec {
 			},
 		},
 	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "spawn_teammate",
+			Description: "Spawn or resume a persistent teammate that works in its own goroutine and communicates via inbox messages.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type": "string",
+					},
+					"role": map[string]any{
+						"type": "string",
+					},
+					"prompt": map[string]any{
+						"type": "string",
+					},
+				},
+				"required": []string{"name", "role", "prompt"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "list_teammates",
+			Description: "List all teammates and their current status.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "send_message",
+			Description: "Send a message from the lead to a teammate inbox.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"to": map[string]any{
+						"type": "string",
+					},
+					"content": map[string]any{
+						"type": "string",
+					},
+					"msg_type": map[string]any{
+						"type": "string",
+						"enum": validMessageTypeValues(),
+					},
+				},
+				"required": []string{"to", "content"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "read_inbox",
+			Description: "Read and drain the lead inbox.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "broadcast",
+			Description: "Broadcast a message from the lead to all teammates.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"content": map[string]any{
+						"type": "string",
+					},
+				},
+				"required": []string{"content"},
+			},
+		},
+	})
 	return tools
 }
 
@@ -595,7 +701,7 @@ func loadConfig() (config, error) {
 		APIKey:  apiKey,
 		Model:   model,
 
-		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
+		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.\nWhen the user asks for persistent teammates or team communication, prefer spawn_teammate, send_message, read_inbox, list_teammates, and broadcast instead of using task as a workaround.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
 			wd, skills.Descriptions()),
 		SubagentSystem: fmt.Sprintf(
 			"You are a coding subagent at %s. Complete the given task, then summarize your findings.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
@@ -814,6 +920,68 @@ func runToolCall(cfg config, call toolCall) string {
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
 
+	case "spawn_teammate":
+		var input spawnTeammateInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		member, err := teammateManager.Spawn(cfg, input.Name, input.Role, input.Prompt)
+		if err != nil {
+			return fmt.Sprintf("failed to spawn teammate: %v", err)
+		}
+
+		output := fmt.Sprintf("spawned teammate %s (%s): %s", member.Name, member.Role, member.Status)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "list_teammates":
+		output := teammateManager.ListAll()
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "send_message":
+		var input sendMessageInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		msgType := strings.TrimSpace(input.MsgType)
+		if msgType == "" {
+			msgType = msgTypeMessage
+		}
+
+		output := teamBus.Send("lead", input.To, msgType, input.Content, nil)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "read_inbox":
+		msgs, err := teamBus.ReadInbox("lead")
+		if err != nil {
+			return fmt.Sprintf("failed to read lead inbox: %v", err)
+		}
+
+		data, err := json.MarshalIndent(msgs, "", "  ")
+		if err != nil {
+			return fmt.Sprintf("failed to marshal lead inbox: %v", err)
+		}
+
+		output := string(data)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "broadcast":
+		var input struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		output := teamBus.Broadcast("lead", input.Content, teammateManager.MemberNames())
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
 	default:
 		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}
@@ -952,6 +1120,17 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 	roundsSinceTodo := 0
 
 	for {
+		leadInbox, err := teamBus.ReadInbox("lead")
+		if err == nil && len(leadInbox) > 0 {
+			data, marshalErr := json.MarshalIndent(leadInbox, "", "  ")
+			if marshalErr == nil {
+				*history = append(*history, apiMessage{
+					Role:    "user",
+					Content: fmt.Sprintf("<inbox>\n%s\n</inbox>", string(data)),
+				})
+			}
+		}
+
 		notifs := backgroundManager.DrainNotifications()
 		if len(notifs) > 0 {
 			var lines []string
@@ -1058,4 +1237,3 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 		}
 	}
 }
-

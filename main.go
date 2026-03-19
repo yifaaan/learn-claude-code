@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -24,7 +25,7 @@ func main() {
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 
 	for {
-		fmt.Print("\033[36ms06 >> \033[0m")
+		fmt.Print("\033[36ms09 >> \033[0m")
 		if !scanner.Scan() {
 			break
 		}
@@ -37,6 +38,28 @@ func main() {
 		lower := strings.ToLower(query)
 		if lower == "q" || lower == "exit" {
 			break
+		}
+		if query == "/team" {
+			fmt.Println(teammateManager.ListAll())
+			fmt.Println()
+			continue
+		}
+		if query == "/inbox" {
+			msgs, err := teamBus.ReadInbox("lead")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "read inbox: %v\n\n", err)
+				continue
+			}
+
+			data, err := json.MarshalIndent(msgs, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "marshal inbox: %v\n\n", err)
+				continue
+			}
+
+			fmt.Println(string(data))
+			fmt.Println()
+			continue
 		}
 
 		history = append(history, apiMessage{
