@@ -52,48 +52,42 @@ var dangerouseFraments = []string{
 	"> /dev/",
 }
 
-// 全局任务状态实例
+// Global todo state used by the todo tool.
 var todoState = &todoManager{}
 
-// 持久化的任务管理器，存储在当前目录下的 tasks 文件夹里
+// Persistent task manager backed by files in the local tasks directory.
 var taskManager = NewTaskManager(filepath.Join(mustGetwd(), "tasks"))
 
-// 全局后台任务管理器，允许模型在后台并发执行任务，并在下一轮对话开始前把结果注入到对话里
+// Global background task manager for asynchronous command execution.
 var backgroundManager = NewBackgroundManager()
 
-// BackgroundTask 表示一个正在后台运行或已经结束的任务
+// BackgroundTask stores the current state of one background command.
 type BackgroundTask struct {
-	ID      string // 任务 ID，可以用来查询任务状态
-	Command string // 任务执行的命令
+	ID      string // Stable task ID used by check_background.
+	Command string // Command text associated with the task.
 	Status  string // running / completed / failed / error
-	Result  string // 任务执行结果的简要描述
+	Result  string // Final output captured for the task.
 }
 
-// BackgroundNotification 表示“需要在下一轮 LLM 调用前注入”的通知
-// 一次性的，注入后就不再保留了
+// BackgroundNotification is a queued event injected before the next model call.
 type BackgroundNotification struct {
-	ID      string
+	ID      string // Stable task ID associated with this notification.
 	Status  string
-	Command string
-	Result  string
+	Command string // Command preview for display in the conversation.
+	Result  string // Result preview injected back into the conversation.
 }
 
-// BackgroundManager 负责并发安全地管理后台任务。
-// mutex：
-// - 主 goroutine 会查任务、取通知
-// - 后台 goroutine 会写任务结果、塞通知
-// 这两个方向会并发访问同一个 map / slice
+// BackgroundManager coordinates task state and completion notifications.
 type BackgroundManager struct {
 	mu sync.Mutex
 
 	nextID int
 	tasks  map[string]*BackgroundTask
 
-	// notifications 是“需要在下一轮 LLM 调用前注入”的通知列表
-	notifications []BackgroundNotification
+	notifications []BackgroundNotification // Pending completion events.
 }
 
-// NewBackgroundManager 初始化内存态后台任务管理器
+// NewBackgroundManager creates an in-memory background manager.
 func NewBackgroundManager() *BackgroundManager {
 	return &BackgroundManager{
 		tasks:         make(map[string]*BackgroundTask),
@@ -101,13 +95,11 @@ func NewBackgroundManager() *BackgroundManager {
 	}
 }
 
-// Start 返回 taskID， 同时在后台 goroutine 里执行 runner
-// manager 不关心 runner 是什么，只负责管理任务状态和通知
+// Start registers a task immediately and runs the command in a goroutine.
 func (m *BackgroundManager) Start(command string, runner func(string) (string, string)) string {
 	m.mu.Lock()
 
 	m.nextID++
-	// 生成一个唯一的 taskID，格式是 "bg-0001", "bg-0002"
 	taskID := fmt.Sprintf("bg-%04d", m.nextID)
 
 	m.tasks[taskID] = &BackgroundTask{
@@ -129,12 +121,10 @@ func (m *BackgroundManager) Start(command string, runner func(string) (string, s
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
-		// 更新任务执行后的状态
 		task := m.tasks[taskID]
 		task.Status = status
 		task.Result = result
 
-		// 把这个结果塞到 notifications 里，等下一轮 LLM 调用前注入到对话里
 		m.notifications = append(m.notifications, BackgroundNotification{
 			ID:      taskID,
 			Status:  status,
@@ -146,18 +136,18 @@ func (m *BackgroundManager) Start(command string, runner func(string) (string, s
 	return taskID
 }
 
-// DrainNotifications 返回当前所有待投递通知，并立即清空队列
+// DrainNotifications returns all queued notifications and clears the queue.
 func (m *BackgroundManager) DrainNotifications() []BackgroundNotification {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	out := make([]BackgroundNotification, len(m.notifications))
 	copy(out, m.notifications)
-	m.notifications = m.notifications[:0] // 清空队列
+	m.notifications = m.notifications[:0] // clear queue
 	return out
 }
 
-// Check 查询单个后台任务：如果 taskID 为空，列出所有任务
+// Check returns one task by ID, or all tasks when taskID is empty.
 func (m *BackgroundManager) Check(taskID string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -188,9 +178,19 @@ func (m *BackgroundManager) Check(taskID string) string {
 	return strings.Join(lines, "\n")
 }
 
-// bashToolInput 是传递给 bash 工具的输入参数结构
+// bashToolInput is the JSON payload accepted by the bash tool.
 type bashToolInput struct {
 	Command string `json:"command"`
+}
+
+// backgroundRunInput is the JSON payload accepted by background_run.
+type backgroundRunInput struct {
+	Command string `json:"command"`
+}
+
+// checkBackgroundInput is the JSON payload accepted by check_background.
+type checkBackgroundInput struct {
+	TaskID string `json:"task_id,omitempty"`
 }
 
 type config struct {
@@ -203,31 +203,16 @@ type config struct {
 	Client         *http.Client
 }
 
-// apiMessage 表示一条对话消息。
-// 这是整个对话历史 history 的基本单元。
-//
-// 它需要同时支持几种角色：
-// 1. system
-// 2. user
-// 3. assistant
-// 4. tool
-//
-// 不同角色用到的字段不完全一样，所以这里用一个“通用结构”承载
+// apiMessage is the common message format stored in conversation history.
 type apiMessage struct {
 	Role    string `json:"role"`
 	Content any    `json:"content"`
 
-	// Toolcalls 只在 assistant 请求调用工具时返回，包含工具调用的详细信息
-	// 普通的 user/system/tool 消息不包含 ToolCalls 字段
 	ToolCalls []toolCall `json:"tool_calls,omitempty"`
 
-	// ToolCallID 只在 role=tool 的消息中使用
-	// 当模型请求调用工具时，生成一个唯一的 ToolCallID，后续工具执行结果会通过这个 ID 关联回对应的消息
 	ToolCallID string `json:"tool_call_id,omitempty"`
 }
 
-// toolCall 表示模型返回的一次工具调用请求
-//
 //	{
 //	  "id": "call_xxx",
 //	  "type": "function",
@@ -236,32 +221,24 @@ type apiMessage struct {
 //	    "arguments": "{\"command\": \"ls -la\"}"
 //	  }
 //	}
+// toolCall describes one tool request returned by the model.
 type toolCall struct {
 	ID       string       `json:"id"`
-	Type     string       `json:"type"`
+	Type     string       `json:"type"` // always "function"
 	Function toolFunction `json:"function"`
 }
 
-// toolFunction 这个结构会被复用在两个场景：
-//
-// 场景 1：定义工具时
-// - 需要 Name / Description / Parameters
-//
-// 场景 2：模型返回函数调用时
-// - 需要 Name / Arguments
-//
-// 所以把它们合并进同一个结构里
+// toolFunction is reused in tool declarations and tool call payloads.
 type toolFunction struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	Parameters  map[string]any `json:"parameters,omitempty"`
-	Arguments   string         `json:"arguments,omitempty"` // 序列化的 JSON 字符串(因为参数各不相同），包含模型传入的参数值
+	Arguments   string         `json:"arguments,omitempty"` // Serialized JSON arguments from the model.
 }
 
-// toolSpec 表示“我向模型声明了哪些工具可以用”。
-// OpenAI 兼容接口里，通常外层会有一个 type=function 的包装
+// toolSpec declares one tool that is available to the model.
 type toolSpec struct {
-	Type     string       `json:"type"` // 固定为 "function"
+	Type     string       `json:"type"` // always "function"
 	Function toolFunction `json:"function"`
 }
 
@@ -292,18 +269,7 @@ type apiError struct {
 	Type    string `json:"type"`
 }
 
-// toolDefinitions 返回我声明给模型的工具列表
-// 把工具的名字、描述、参数 schema
-// 告诉模型，让模型知道自己可以发起什么样的 tool call
-// func toolDefinitions() []toolSpec {
-
-// }
-
-// - bash
-// - read_file
-// - write_file
-// - edit_file
-// - load_skill
+// baseToolDefinitions returns the core file and shell tools.
 func baseToolDefinitions() []toolSpec {
 	return []toolSpec{
 		{
@@ -458,7 +424,6 @@ func parentToolDefinitions() []toolSpec {
 		},
 	})
 
-	// task，用来创建子 agent
 	tools = append(tools, toolSpec{
 		Type: "function",
 		Function: toolFunction{
@@ -560,6 +525,41 @@ func parentToolDefinitions() []toolSpec {
 			},
 		},
 	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "background_run",
+			Description: "Run a shell command in the background and rreturn a task ID immediately.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{
+						"type":        "string",
+						"description": "Shell command to execute asynchronously.",
+					},
+				},
+				"required": []string{"command"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "check_background",
+			Description: "Check one background task by task_id, or list all background tasks when task_id is omitted.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task_id": map[string]any{
+						"type":        "string",
+						"description": "Optional background task ID such as bg-0001.",
+					},
+				},
+			},
+		},
+	})
 	return tools
 }
 
@@ -642,25 +642,12 @@ func loadDotEnv(path string) error {
 	return nil
 }
 
-// createChatCompletion 负责请求 Qwen 的 /chat/completions 接口。
-//
-// 它做的事情很固定：
-// 1. 先把 system 消息放到最前面
-// 2. 再拼接历史消息 history
-// 3. 把 model / messages / tools 序列化成 JSON
-// 4. 发起 HTTP POST 请求
-// 5. 读取并解析响应
-// 6. 如果接口报错，返回可读的错误信息
+// createChatCompletion calls the chat completion API with the parent tool set.
 func createChatCompletion(cfg config, history []apiMessage) (chatResponse, error) {
 	return createChatCompletionWithTools(cfg, cfg.System, history, parentToolDefinitions())
 }
 
-// runToolCall 负责执行模型请求的单个工具调用。
-//
-// 它并不直接“理解业务”，只做三件事：
-// 1. 校验工具类型和工具名
-// 2. 解析 arguments JSON
-// 3. 调用 runBash() 执行命令
+// runToolCall decodes tool arguments and dispatches to the local implementation.
 func runToolCall(cfg config, call toolCall) string {
 	if call.Type != "function" {
 		return fmt.Sprintf("unsupported tool call type: %s", call.Type)
@@ -668,7 +655,6 @@ func runToolCall(cfg config, call toolCall) string {
 
 	fmt.Printf("\033[33m> %s\033[0m\n", call.Function.Name)
 
-	// 解析模型传入的参数。对于 function 类型的工具调用，参数是一个 JSON 字符串，包含在 call.Function.Arguments 字段里。
 	switch call.Function.Name {
 	case "bash":
 		var input bashToolInput
@@ -719,7 +705,7 @@ func runToolCall(cfg config, call toolCall) string {
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
 
-	case "task": // 这个工具会创建一个子 agent 来完成任务
+	case "task":
 		var input taskInput
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
 			return fmt.Sprintf("invalid tool arguments: %v", err)
@@ -805,11 +791,94 @@ func runToolCall(cfg config, call toolCall) string {
 		output := fmt.Sprintf("Task #%d: %s - %s (status=%s, blocked_by=%v, blocks=%v, owner=%s)", task.ID, task.Subject, task.Description, task.Status, task.BlockedBy, task.Blocks, task.Owner)
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
+
+	case "background_run":
+		var input backgroundRunInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		taskID := backgroundManager.Start(input.Command, runBackgroundCommand)
+
+		output := fmt.Sprintf("Background task %s started: %s", taskID, truncateText(input.Command, 80))
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "check_background":
+		var input checkBackgroundInput
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		output := backgroundManager.Check(input.TaskID)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
 	default:
 		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}
 }
 
+// runBackgroundCommand executes a command asynchronously and returns status plus output.
+func runBackgroundCommand(command string) (status string, result string) {
+	lower := strings.ToLower(command)
+
+	for _, fragment := range dangerouseFraments {
+		if strings.Contains(lower, strings.ToLower(fragment)) {
+			return "error", fmt.Sprintf("command contains dangerous fragment '%s', refusing to execute", fragment)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var cmd *exec.Cmd
+
+	if isWindows() {
+		if hasBash() {
+			cmd = exec.CommandContext(ctx, "bash", "-c", command)
+		} else {
+			psCommand := strings.ReplaceAll(command, "&&", ";")
+			cmd = exec.CommandContext(ctx, "powershell", "-Command", psCommand)
+		}
+	} else {
+		cmd = exec.CommandContext(ctx, "sh", "-c", command)
+	}
+
+	cmd.Dir = mustGetwd()
+
+	output, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return "timed_out", "Error: command timed out"
+	}
+
+	text := strings.TrimSpace(string(output))
+	if err != nil {
+		if text == "" {
+			return "error", err.Error()
+		}
+		return "failed", truncateText(text, maxToolOutputRunes)
+	}
+	if text == "" {
+		text = "(no output)"
+	}
+	return "completed", truncateText(text, maxToolOutputRunes)
+}
+
+// isWindows reports whether the current process is running on Windows.
+func isWindows() bool {
+	return strings.Contains(strings.ToLower(os.Getenv("OS")), "windows") ||
+		strings.HasSuffix(strings.ToLower(os.Getenv("COMSPEC")), ".exe")
+}
+
+// hasBash reports whether bash is available in PATH.
+func hasBash() bool {
+	_, err := exec.LookPath("bash")
+	return err == nil
+}
+
+// runBash executes a blocking shell command with a timeout.
 func runBash(command string) string {
 	lower := strings.ToLower(command)
 
@@ -819,7 +888,6 @@ func runBash(command string) string {
 		}
 	}
 
-	// 超时
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 
@@ -845,8 +913,7 @@ func runBash(command string) string {
 	return truncateText(text, maxToolOutputRunes)
 }
 
-// mustGetwd 提供一个“获取当前目录”的兜底实现。
-// 正常情况下 os.Getwd() 不会失败；如果失败，就退回 "."。
+// mustGetwd returns the current working directory, or "." on failure.
 func mustGetwd() string {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -855,7 +922,7 @@ func mustGetwd() string {
 	return wd
 }
 
-// truncateText 按 rune 截断字符串，避免直接按字节截断中文导致乱码。
+// truncateText truncates by rune count to avoid breaking UTF-8 characters.
 func truncateText(input string, limit int) string {
 	runes := []rune(input)
 	if len(runes) <= limit {
@@ -864,9 +931,7 @@ func truncateText(input string, limit int) string {
 	return string(runes[:limit])
 }
 
-// contentText 用来把模型返回的 content 安全地转换成字符串。
-//
-// 前面把 responseMessage.Content / apiMessage.Content 定义成了 any，
+// contentText converts API content into a plain string representation.
 func contentText(content any) string {
 	switch value := content.(type) {
 	case nil:
@@ -882,14 +947,24 @@ func contentText(content any) string {
 	}
 }
 
+// agentLoop is the core tool-use loop for the parent agent.
 func agentLoop(cfg config, history *[]apiMessage) (string, error) {
-	// roundsSinceTodo 用来记录连续多少轮没有使用 todo 工具了。
-	// 如果连续多轮都没有使用了，说明模型可能已经忘记了这个工具的存在了
-	// reminder提醒模型使用 todo 工具来规划和跟踪任务进度
 	roundsSinceTodo := 0
 
 	for {
-		// 每轮对话开始前都做一次 compact，去掉历史消息里不必要的内容，保持对话历史的精简和相关，可以让模型更好地理解上下文，提升性能。
+		notifs := backgroundManager.DrainNotifications()
+		if len(notifs) > 0 {
+			var lines []string
+			for _, n := range notifs {
+				lines = append(lines, fmt.Sprintf("[bg:%s] %s:%s", n.ID, n.Status, n.Result))
+			}
+
+			*history = append(*history, apiMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("<background-results>\n%s\n</background-results>", strings.Join(lines, "\n")),
+			})
+		}
+
 		microCompact(*history)
 
 		if estimateTokens(*history) > compactThreshold {
@@ -911,11 +986,9 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 
 		message := response.Choices[0].Message
 
-		// 本轮模型回复里没有工具调用了，说明模型认为自己已经完成了任务，可以停止了
 		if len(message.ToolCalls) == 0 {
 			reply := contentText(message.Content)
 
-			// 把模型的最终回复也加到 history 里
 			*history = append(*history, apiMessage{
 				Role:    "assistant",
 				Content: reply,
@@ -923,24 +996,19 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 			return reply, nil
 		}
 
-		// 模型请求了工具调用，先把这条消息加到 history 里（包含工具调用信息）
 		*history = append(*history, apiMessage{
 			Role:      "assistant",
 			Content:   contentText(message.Content),
 			ToolCalls: message.ToolCalls,
 		})
 
-		// 记录本轮是否使用了 todo 工具，如果连续多轮都没有使用 todo 工具，说明模型可能已经忘记了这个工具的存在了
 		usedTodo := false
 
-		// 手动指定了压缩
 		manualCompact := false
 		manualCompactFocus := ""
 
-		// 依次执行模型请求的工具调用，把结果一条条加到 history 里
 		for _, call := range message.ToolCalls {
 			var output string
-			// 如果工具调用是 compact，就不直接执行压缩，而是设置一个标记，等这个循环结束后再统一压缩一次。这样做的好处是，如果模型连续调用了多次工具，每次都触发一次压缩，可能会导致过度压缩，把重要信息也压缩掉了。等循环结束后再根据最后一次调用的 focus 来决定怎么压缩，可以更好地保留重要信息。
 			if call.Function.Name == "compact" {
 				manualCompact = true
 
@@ -982,7 +1050,6 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 			roundsSinceTodo++
 		}
 
-		// 下一轮该更新 todo 了
 		if roundsSinceTodo >= 3 {
 			*history = append(*history, apiMessage{
 				Role:    "user",
@@ -991,3 +1058,4 @@ func agentLoop(cfg config, history *[]apiMessage) (string, error) {
 		}
 	}
 }
+
