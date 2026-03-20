@@ -2,11 +2,21 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	// 空闲轮询间隔（秒）
+	pollInterval = 5 * time.Second
+	// 空闲超时时间（秒）- 超过此时间没有新工作就关闭
+	idleTimeOut = 60 * time.Second
 )
 
 var validStatuses = map[string]bool{
@@ -44,6 +54,7 @@ type taskGetInput struct {
 type TaskManager struct {
 	dir    string // task_*.json文件所在目录
 	nextID int    // 下一个可用任务ID
+	mu     sync.Mutex
 }
 
 func NewTaskManager(dir string) *TaskManager {
@@ -63,6 +74,50 @@ func NewTaskManager(dir string) *TaskManager {
 	}
 }
 
+// ScanUnclaimedTasks 扫描任务目录，返回所有未被认领且无依赖阻塞的任务
+func (tm *TaskManager) ScanUnclaimedTasks() []*Task {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	taskPaths, err := filepath.Glob(filepath.Join(tm.dir, "task_*.json"))
+	if err != nil {
+		return nil
+	}
+
+	tasks := make([]*Task, 0)
+	for _, path := range taskPaths {
+		var id int
+		fmt.Sscanf(filepath.Base(path), "task_%d.json", &id)
+		task, err := tm.load(id)
+		if err != nil {
+			continue
+		}
+		// Agent 需要主动发现可以开始工作的任务。只有 pending 状态、无负责人、无阻塞依赖的任务才能被自动认领
+		if task.Status == "pending" && task.Owner == "" && len(task.BlockedBy) == 0 {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+// ClaimTask 认领一个任务，将其分配给指定的 owner
+func (tm *TaskManager) ClaimTask(taskID int, owner string) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	task, err := tm.load(taskID)
+	if err != nil {
+		return err
+	}
+	if task.Status == "pending" && task.Owner == "" && len(task.BlockedBy) == 0 {
+		task.Owner = owner
+		task.Status = "in_progress"
+		tm.saveLocked(task)
+		return nil
+	}
+	return errors.New("task already claimed")
+}
+
 func (tm *TaskManager) save(task *Task) error {
 	path := filepath.Join(tm.dir, fmt.Sprintf("task_%d.json", task.ID))
 	f, err := os.Create(path)
@@ -74,6 +129,25 @@ func (tm *TaskManager) save(task *Task) error {
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(task)
+}
+
+func (tm *TaskManager) saveLocked(task *Task) error {
+	path := filepath.Join(tm.dir, fmt.Sprintf("task_%d.json", task.ID))
+	tmp := path + ".tmp"
+	data, err := json.MarshalIndent(task, "", "  ")
+	if err != nil {
+		return nil
+	}
+
+	// 先写临时文件
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (tm *TaskManager) load(taskID int) (*Task, error) {

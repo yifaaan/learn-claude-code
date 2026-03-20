@@ -482,10 +482,11 @@ func (tm *TeammateManager) launchTeammate(cfg config, name, role, prompt string)
 
 func (tm *TeammateManager) teammateLoop(cfg config, name, role, prompt string) {
 	defer func() {
-		_ = tm.finishRun(name, tm.consumeNextStatus(name, teammateStatusIdle))
+		_ = tm.finishRun(name, tm.consumeNextStatus(name, teammateStatusShutdown))
 	}()
 
 	system := tm.teammateSystemPrompt(name, role)
+	teamName := tm.config.TeamName
 	history := make([]apiMessage, 0, 4)
 	if strings.TrimSpace(prompt) != "" {
 		history = append(history, apiMessage{
@@ -506,21 +507,47 @@ func (tm *TeammateManager) teammateLoop(cfg config, name, role, prompt string) {
 		})
 	}
 
+	for {
+		var idleRequest bool
+		shouldContinue := tm.runWorkPhase(cfg, name, role, system, &history, &idleRequest)
+		if !shouldContinue {
+			return
+		}
+
+		shouldResume := tm.runIdlePhase(cfg, name, role, teamName, &history)
+		if !shouldResume {
+			return // 超时60秒，退出
+		}
+
+		// 存在新任务或新消息，继续循环
+	}
+}
+
+// runWorkPhase 执行工作阶段
+//
+// 参数:
+//   - idleRequested: *bool 指针，execTeammateTool 检测到 idle 工具时设置为 true
+//
+// 返回值:
+//   - true: 进入 idle 阶段
+//   - false: 应该 shutdown（收到 shutdown_request 并批准）
+func (tm *TeammateManager) runWorkPhase(cfg config, name string, role string, system string, history *[]apiMessage, idleRequested *bool) bool {
+	*idleRequested = false
 	tools := tm.teammateToolDefinitions()
 
 	for iteration := 0; iteration < 30; iteration++ {
 		inboxMessages, err := tm.drainInboxAsMessages(name)
 		if err == nil && len(inboxMessages) > 0 {
-			history = append(history, inboxMessages...)
+			*history = append(*history, inboxMessages...)
 		}
 
-		response, err := createChatCompletionWithTools(cfg, system, history, tools)
+		response, err := createChatCompletionWithTools(cfg, system, *history, tools)
 		if err != nil {
-			return
+			return true
 		}
 
 		if len(response.Choices) == 0 {
-			return
+			return true
 		}
 
 		message := response.Choices[0].Message
@@ -530,14 +557,14 @@ func (tm *TeammateManager) teammateLoop(cfg config, name, role, prompt string) {
 				reply = "(no summary)"
 			}
 
-			history = append(history, apiMessage{
+			*history = append(*history, apiMessage{
 				Role:    "assistant",
 				Content: reply,
 			})
-			break
+			return true
 		}
 
-		history = append(history, apiMessage{
+		*history = append(*history, apiMessage{
 			Role:      "assistant",
 			Content:   contentText(message.Content),
 			ToolCalls: message.ToolCalls,
@@ -545,13 +572,78 @@ func (tm *TeammateManager) teammateLoop(cfg config, name, role, prompt string) {
 
 		for _, call := range message.ToolCalls {
 			output := tm.execTeammateTool(cfg, name, call)
-			history = append(history, apiMessage{
+			if output == "Entering idle phase. Will poll for new tasks." {
+				*idleRequested = true
+			}
+			*history = append(*history, apiMessage{
 				Role:       "tool",
 				Content:    output,
 				ToolCallID: call.ID,
 			})
 		}
+
+		if *idleRequested {
+			break
+		}
 	}
+	return true
+}
+
+// runIdlePhase 执行空闲阶段，轮询 inbox 和任务板
+//
+// 返回值:
+//   - true: 发现了新工作，应该恢复到 WORK 状态
+//   - false: 超时 60 秒，应该 shutdown
+func (tm *TeammateManager) runIdlePhase(cfg config, name, role, teamName string, history *[]apiMessage) bool {
+	polls := int(idleTimeOut / pollInterval)
+
+	for i := 0; i < polls; i++ {
+		time.Sleep(pollInterval)
+
+		// check inbox
+		msgs, _ := tm.bus.ReadInbox(name)
+		for _, msg := range msgs {
+			if msg.Type == msgTypeShutdownRequest {
+				data, _ := json.MarshalIndent(msgs, "", "  ")
+				*history = append(*history, apiMessage{
+					Role:    "user",
+					Content: fmt.Sprintf("<inbox>\n%s\n</inbox>", string(data)),
+				})
+				return true
+			}
+		}
+
+		if len(msgs) > 0 {
+			data, _ := json.MarshalIndent(msgs, "", "  ")
+			*history = append(*history, apiMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("<inbox>\n%s\n</inbox>", string(data)),
+			})
+			return true
+		}
+		// 扫描未认领任务
+		unclaimed := taskManager.ScanUnclaimedTasks()
+		if len(unclaimed) > 0 {
+			task := unclaimed[0]
+			taskManager.ClaimTask(task.ID, name)
+
+			// 身份重注入
+			if len(*history) <= 3 {
+				identityBlock := tm.makeIdentityBlock(name, role, teamName)
+				*history = append([]apiMessage{identityBlock}, *history...)
+			}
+
+			taskPrompt := fmt.Sprintf("<auto-claimed>Task #%d: %s\n%s</auto-claimed>",
+				task.ID, task.Subject, task.Description)
+			*history = append(*history, apiMessage{
+				Role:    "user",
+				Content: taskPrompt,
+			})
+
+			return true
+		}
+	}
+	return false
 }
 
 func buildInitialPlanRequest(role, prompt string) string {
@@ -704,6 +796,18 @@ func (tm *TeammateManager) teammateToolDefinitions() []toolSpec {
 		},
 	})
 
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "idle",
+			Description: "Signal that you have no more work. Enters idle polling phase where you will wait for new tasks or messages.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	})
+
 	return tools
 }
 
@@ -828,6 +932,12 @@ func (tm *TeammateManager) execTeammateTool(cfg config, sender string, call tool
 		}
 		sendResult := tm.bus.Send(sender, "lead", msgTypePlanApprovalRequest, input.Plan, extra)
 		return fmt.Sprintf("%s (request_id=%s). Wait for a plan_approval_response before proceeding with risky work.", sendResult, reqID)
+
+	case "idle":
+		// 设置一个标志让 runWorkPhase 知道要进入 idle
+		// 可以通过返回特殊字符串来传递信号
+		return "Entering idle phase. Will poll for new tasks."
+
 	default:
 		return fmt.Sprintf("unsupported teammate tool: %s", call.Function.Name)
 	}
@@ -889,6 +999,16 @@ func (tm *TeammateManager) consumeNextStatus(name, fallback string) string {
 
 	delete(tm.nextStatus, name)
 	return status
+}
+
+// makeIdentityBlock 创建一个包含 agent 身份信息的消息
+// LLM 对话历史压缩后，agent 可能"忘记"自己的身份
+// 该消息在context压缩后，插入history，确保agent知道自己的身份
+func (tm *TeammateManager) makeIdentityBlock(name, role, teamName string) apiMessage {
+	return apiMessage{
+		Role:    "user",
+		Content: fmt.Sprintf("<identity>You are '%s', role: %s, team: %s. Continue your work.</identity>", name, role, teamName),
+	}
 }
 
 func generateRequestID() string {
