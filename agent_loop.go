@@ -67,6 +67,9 @@ var teammateManager = NewTeammateManager(filepath.Join(mustGetwd(), ".team"), te
 // Global background task manager for asynchronous command execution.
 var backgroundManager = NewBackgroundManager()
 
+// Global worktree manager for task isolation.
+var worktreeManager = NewWorktreeManager(filepath.Join(mustGetwd(), ".worktrees"), taskManager)
+
 // BackgroundTask stores the current state of one background command.
 type BackgroundTask struct {
 	ID      string // Stable task ID used by check_background.
@@ -724,6 +727,142 @@ func parentToolDefinitions() []toolSpec {
 		},
 	})
 
+	// Worktree tools for task isolation
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "worktree_create",
+			Description: "Create a new git worktree for isolated work. Optionally bind to a task to auto-set status to in_progress.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Worktree name (used for directory and branch)",
+					},
+					"task_id": map[string]any{
+						"type":        "integer",
+						"description": "Optional task ID to bind to this worktree",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "worktree_remove",
+			Description: "Remove a worktree. Set complete_task=true to also mark the bound task as completed.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Worktree name to remove",
+					},
+					"force": map[string]any{
+						"type":        "boolean",
+						"description": "Force removal even with uncommitted changes",
+					},
+					"complete_task": map[string]any{
+						"type":        "boolean",
+						"description": "Also mark bound task as completed",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "worktree_keep",
+			Description: "Mark a worktree as kept for later use.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Worktree name to keep",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "worktree_run",
+			Description: "Run a shell command in a worktree directory.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Worktree name",
+					},
+					"command": map[string]any{
+						"type":        "string",
+						"description": "Shell command to run",
+					},
+				},
+				"required": []string{"name", "command"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "worktree_list",
+			Description: "List all worktrees and their status.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "worktree_status",
+			Description: "Get status of a specific worktree.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Worktree name",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "worktree_events",
+			Description: "List recent worktree lifecycle events.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "Maximum number of events to return",
+					},
+				},
+			},
+		},
+	})
+
 	return tools
 }
 
@@ -1080,6 +1219,136 @@ func runToolCall(cfg config, call toolCall) string {
 		output := handlePlanReview(cfg, input.RequestID, input.Approve, input.Feedback)
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
+
+	// Worktree tool handlers
+	case "worktree_create":
+		var input struct {
+			Name   string `json:"name"`
+			TaskID *int   `json:"task_id,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		meta, err := worktreeManager.Create(input.Name, input.TaskID)
+		if err != nil {
+			return fmt.Sprintf("failed to create worktree: %v", err)
+		}
+
+		taskStr := ""
+		if meta.TaskID != nil {
+			taskStr = fmt.Sprintf(" (task: %d)", *meta.TaskID)
+		}
+		output := fmt.Sprintf("Created worktree '%s' at %s with branch %s%s", meta.Name, meta.Path, meta.Branch, taskStr)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "worktree_remove":
+		var input struct {
+			Name         string `json:"name"`
+			Force        bool   `json:"force,omitempty"`
+			CompleteTask bool   `json:"complete_task,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		meta, err := worktreeManager.Remove(input.Name, input.Force, input.CompleteTask)
+		if err != nil {
+			return fmt.Sprintf("failed to remove worktree: %v", err)
+		}
+
+		output := fmt.Sprintf("Removed worktree '%s' (branch: %s)", meta.Name, meta.Branch)
+		if input.CompleteTask && meta.TaskID != nil {
+			output += fmt.Sprintf(" and completed task %d", *meta.TaskID)
+		}
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "worktree_keep":
+		var input struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		meta, err := worktreeManager.Keep(input.Name)
+		if err != nil {
+			return fmt.Sprintf("failed to keep worktree: %v", err)
+		}
+
+		output := fmt.Sprintf("Worktree '%s' marked as kept", meta.Name)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "worktree_run":
+		var input struct {
+			Name    string `json:"name"`
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		result, err := worktreeManager.Run(input.Name, input.Command)
+		if err != nil {
+			return fmt.Sprintf("failed to run in worktree: %v", err)
+		}
+
+		output := fmt.Sprintf("[%s] %s", input.Name, truncateText(result, maxToolOutputRunes))
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "worktree_list":
+		output := worktreeManager.ListAll()
+		fmt.Println(output)
+		return output
+
+	case "worktree_status":
+		var input struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		meta, err := worktreeManager.Status(input.Name)
+		if err != nil {
+			return fmt.Sprintf("failed to get worktree status: %v", err)
+		}
+
+		taskStr := ""
+		if meta.TaskID != nil {
+			taskStr = fmt.Sprintf(", task: %d", *meta.TaskID)
+		}
+		output := fmt.Sprintf("Worktree '%s': path=%s, branch=%s, status=%s%s, created=%d",
+			meta.Name, meta.Path, meta.Branch, meta.Status, taskStr, meta.CreatedAt)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "worktree_events":
+		var input struct {
+			Limit int `json:"limit,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		if input.Limit == 0 {
+			input.Limit = 10
+		}
+
+		events := worktreeManager.ListEvents(input.Limit)
+		data, err := json.MarshalIndent(events, "", "  ")
+		if err != nil {
+			return fmt.Sprintf("failed to marshal events: %v", err)
+		}
+
+		output := string(data)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
 	default:
 		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}

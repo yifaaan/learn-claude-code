@@ -29,10 +29,11 @@ type Task struct {
 	ID          int    `json:"id"`
 	Subject     string `json:"subject"`
 	Description string `json:"description"`
-	BlockedBy   []int  `json:"blocked_by"` // 依赖的任务ID列表
-	Blocks      []int  `json:"blocks"`     // 被哪些任务依赖的ID列表
-	Status      string `json:"status"`     // "pending", "in_progress", "completed"
-	Owner       string `json:"owner"`      // 任务负责人agent的名字
+	BlockedBy   []int  `json:"blocked_by"`      // 依赖的任务ID列表
+	Blocks      []int  `json:"blocks"`          // 被哪些任务依赖的ID列表
+	Status      string `json:"status"`          // "pending", "in_progress", "completed"
+	Owner       string `json:"owner"`           // 任务负责人agent的名字
+	Worktree    string `json:"worktree,omitempty"` // 绑定的worktree名称
 }
 
 type taskCreateInput struct {
