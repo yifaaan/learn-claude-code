@@ -239,6 +239,7 @@ type apiMessage struct {
 //	    "arguments": "{\"command\": \"ls -la\"}"
 //	  }
 //	}
+//
 // toolCall describes one tool request returned by the model.
 type toolCall struct {
 	ID       string       `json:"id"`
@@ -666,6 +667,63 @@ func parentToolDefinitions() []toolSpec {
 			},
 		},
 	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "shutdown_request",
+			Description: "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"teammate": map[string]any{
+						"type":        "string",
+						"description": "Name of the teammate to shut down",
+					},
+				},
+				"required": []string{"teammate"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "plan_review",
+			Description: "Approve or reject a teammate's plan. Use list_pending_plans to see pending requests.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"request_id": map[string]any{
+						"type":        "string",
+						"description": "The request_id from the plan_approval_request",
+					},
+					"approve": map[string]any{
+						"type":        "boolean",
+						"description": "true to approve, false to reject",
+					},
+					"feedback": map[string]any{
+						"type":        "string",
+						"description": "Optional feedback for the teammate",
+					},
+				},
+				"required": []string{"request_id", "approve"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "list_pending_plans",
+			Description: "List all pending plan approval requests from teammates.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	})
+
 	return tools
 }
 
@@ -701,7 +759,7 @@ func loadConfig() (config, error) {
 		APIKey:  apiKey,
 		Model:   model,
 
-		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.\nWhen the user asks for persistent teammates or team communication, prefer spawn_teammate, send_message, read_inbox, list_teammates, and broadcast instead of using task as a workaround.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
+		System: fmt.Sprintf("You are a coding agent at %s. Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. Prefer tools over prose.\nWhen the user asks for persistent teammates or team communication, prefer spawn_teammate, send_message, read_inbox, list_teammates, and broadcast instead of using task as a workaround.\nUse shutdown_request for graceful teammate shutdowns, and use list_pending_plans plus plan_review when teammates submit risky-work plans for approval.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
 			wd, skills.Descriptions()),
 		SubagentSystem: fmt.Sprintf(
 			"You are a coding subagent at %s. Complete the given task, then summarize your findings.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nSkills available:\n%s",
@@ -952,6 +1010,11 @@ func runToolCall(cfg config, call toolCall) string {
 		}
 
 		output := teamBus.Send("lead", input.To, msgType, input.Content, nil)
+		if input.To != "lead" {
+			if err := teammateManager.Wake(cfg, input.To); err != nil && !strings.Contains(err.Error(), "teammate not found") {
+				output = fmt.Sprintf("%s (wake %s: %v)", output, input.To, err)
+			}
+		}
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
 
@@ -982,6 +1045,41 @@ func runToolCall(cfg config, call toolCall) string {
 		fmt.Println(truncateText(output, maxPreviewRunes))
 		return output
 
+	case "shutdown_request":
+		var input struct {
+			Teammate string `json:"teammate"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		output := handleShutdownRequest(cfg, input.Teammate)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "list_pending_plans":
+		pending := listPendingPlanRequests()
+		data, err := json.MarshalIndent(pending, "", "  ")
+		if err != nil {
+			return fmt.Sprintf("failed to marshal pending plans: %v", err)
+		}
+		output := string(data)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
+
+	case "plan_review":
+		var input struct {
+			RequestID string `json:"request_id"`
+			Approve   bool   `json:"approve"`
+			Feedback  string `json:"feedback,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		output := handlePlanReview(cfg, input.RequestID, input.Approve, input.Feedback)
+		fmt.Println(truncateText(output, maxPreviewRunes))
+		return output
 	default:
 		return fmt.Sprintf("unsupported tool: %s", call.Function.Name)
 	}

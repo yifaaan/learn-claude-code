@@ -15,11 +15,16 @@ const (
 	msgTypeBroadcast            = "broadcast"
 	msgTypeShutdownRequest      = "shutdown_request"
 	msgTypeShutdownResponse     = "shutdown_response"
+	msgTypePlanApprovalRequest  = "plan_approval_request"
 	msgTypePlanApprovalResponse = "plan_approval_response"
 
 	teammateStatusIdle     = "idle"
 	teammateStatusWorking  = "working"
 	teammateStatusShutdown = "shutdown"
+
+	statusPending  = "pending"
+	statusApproved = "approved"
+	statusRejected = "rejected"
 )
 
 var validMessageTypes = map[string]bool{
@@ -27,6 +32,7 @@ var validMessageTypes = map[string]bool{
 	msgTypeBroadcast:            true,
 	msgTypeShutdownRequest:      true,
 	msgTypeShutdownResponse:     true,
+	msgTypePlanApprovalRequest:  true,
 	msgTypePlanApprovalResponse: true,
 }
 
@@ -37,6 +43,19 @@ type TeamMessage struct {
 	Timestamp int64          `json:"timestamp"`
 	Extra     map[string]any `json:"extra,omitempty"`
 }
+
+type ProtocolRequest struct {
+	RequestID string `json:"request_id"`
+	From      string `json:"from"`
+	Status    string `json:"status"`
+	Payload   string `json:"payload,omitempty"`
+}
+
+var (
+	shutdownRequests = make(map[string]*ProtocolRequest)
+	planRequests     = make(map[string]*ProtocolRequest)
+	protocolMu       sync.Mutex
+)
 
 type MessageBus struct {
 	inboxDir string // .team/inbox
@@ -78,6 +97,10 @@ func (b *MessageBus) Send(from, to, msgType, content string, extra map[string]an
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if err := os.MkdirAll(b.inboxDir, 0o755); err != nil {
+		return fmt.Sprintf("create inbox dir: %v", err)
+	}
+
 	fp := b.inboxPath(to)
 	f, err := os.OpenFile(fp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -95,6 +118,10 @@ func (b *MessageBus) Send(from, to, msgType, content string, extra map[string]an
 func (b *MessageBus) ReadInbox(name string) ([]TeamMessage, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if err := os.MkdirAll(b.inboxDir, 0o755); err != nil {
+		return nil, err
+	}
 
 	fp := b.inboxPath(name)
 	data, err := os.ReadFile(fp)
@@ -138,7 +165,7 @@ func (b *MessageBus) Broadcast(from, content string, teammates []string) string 
 			continue
 		}
 
-		b.Send(from, name, content, msgTypeBroadcast, nil)
+		b.Send(from, name, msgTypeBroadcast, content, nil)
 		count++
 	}
 	return fmt.Sprintf("broadcast to %d teammates", count)
@@ -161,6 +188,7 @@ type TeammateManager struct {
 	config     TeamConfig
 	bus        *MessageBus
 	running    map[string]bool
+	nextStatus map[string]string
 	mu         sync.Mutex
 }
 
@@ -172,9 +200,11 @@ func NewTeammateManager(teamDir string, bus *MessageBus) *TeammateManager {
 		configPath: filepath.Join(teamDir, "config.json"),
 		bus:        bus,
 		running:    make(map[string]bool),
+		nextStatus: make(map[string]string),
 	}
 
 	tm.config = tm.loadConfig()
+	tm.resetStaleMembers()
 	return tm
 }
 
@@ -219,6 +249,23 @@ func (tm *TeammateManager) saveConfig() error {
 	}
 
 	return os.WriteFile(tm.configPath, data, 0o644)
+}
+
+func (tm *TeammateManager) resetStaleMembers() {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	changed := false
+	for i := range tm.config.Members {
+		if tm.config.Members[i].Status == teammateStatusWorking {
+			tm.config.Members[i].Status = teammateStatusIdle
+			changed = true
+		}
+	}
+
+	if changed {
+		_ = tm.saveConfig()
+	}
 }
 
 func (tm *TeammateManager) findMember(name string) *Teammate {
@@ -332,6 +379,43 @@ func (tm *TeammateManager) MemberNames() []string {
 	return names
 }
 
+func (tm *TeammateManager) IsRunning(name string) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.running[strings.TrimSpace(name)]
+}
+
+func (tm *TeammateManager) Wake(cfg config, name string) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	name = strings.TrimSpace(name)
+	if name == "" || name == "lead" {
+		return nil
+	}
+
+	member := tm.findMember(name)
+	if member == nil {
+		return fmt.Errorf("teammate not found: %s", name)
+	}
+	if member.Status == teammateStatusShutdown || tm.running[name] {
+		return nil
+	}
+
+	member.Status = teammateStatusWorking
+	tm.running[name] = true
+	role := member.Role
+
+	if err := tm.saveConfig(); err != nil {
+		tm.running[name] = false
+		member.Status = teammateStatusIdle
+		return err
+	}
+
+	go tm.teammateLoop(cfg, name, role, "")
+	return nil
+}
+
 func (tm *TeammateManager) Spawn(cfg config, name, role, prompt string) (*Teammate, error) {
 	tm.mu.Lock()
 
@@ -398,15 +482,28 @@ func (tm *TeammateManager) launchTeammate(cfg config, name, role, prompt string)
 
 func (tm *TeammateManager) teammateLoop(cfg config, name, role, prompt string) {
 	defer func() {
-		_ = tm.finishRun(name, teammateStatusIdle)
+		_ = tm.finishRun(name, tm.consumeNextStatus(name, teammateStatusIdle))
 	}()
 
 	system := tm.teammateSystemPrompt(name, role)
-	history := []apiMessage{
-		{
+	history := make([]apiMessage, 0, 4)
+	if strings.TrimSpace(prompt) != "" {
+		history = append(history, apiMessage{
 			Role:    "user",
 			Content: prompt,
-		},
+		})
+	}
+
+	if plan := buildInitialPlanRequest(role, prompt); plan != "" {
+		reqID := generateRequestID()
+		trackPlanRequest(reqID, name, plan)
+		_ = tm.bus.Send(name, "lead", msgTypePlanApprovalRequest, plan, map[string]any{
+			"request_id": reqID,
+		})
+		history = append(history, apiMessage{
+			Role:    "user",
+			Content: fmt.Sprintf("You already submitted plan approval request %s to the lead. Wait for plan_approval_response before doing any risky implementation.", reqID),
+		})
 	}
 
 	tools := tm.teammateToolDefinitions()
@@ -437,7 +534,7 @@ func (tm *TeammateManager) teammateLoop(cfg config, name, role, prompt string) {
 				Role:    "assistant",
 				Content: reply,
 			})
-			return
+			break
 		}
 
 		history = append(history, apiMessage{
@@ -457,11 +554,55 @@ func (tm *TeammateManager) teammateLoop(cfg config, name, role, prompt string) {
 	}
 }
 
+func buildInitialPlanRequest(role, prompt string) string {
+	if !requiresPlanApproval(role, prompt) {
+		return ""
+	}
+
+	task := strings.TrimSpace(prompt)
+	if task == "" {
+		task = fmt.Sprintf("Role-based task for %s", strings.TrimSpace(role))
+	}
+
+	return fmt.Sprintf(
+		"Proposed plan for approval:\n1. Inspect the current implementation and identify the smallest safe refactor surface.\n2. Make the minimum code changes needed for %s.\n3. Run formatting and verification before reporting completion.\nI will wait for approval before editing files.",
+		task,
+	)
+}
+
+func requiresPlanApproval(role, prompt string) bool {
+	text := strings.ToLower(strings.TrimSpace(role + " " + prompt))
+	if text == "" {
+		return false
+	}
+
+	keywords := []string{
+		"risky",
+		"dangerous",
+		"destructive",
+		"refactor",
+		"rewrite",
+		"migration",
+		"rename",
+		"delete",
+		"overhaul",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(text, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (tm *TeammateManager) teammateSystemPrompt(name, role string) string {
 	return fmt.Sprintf(
 		"You are teammate '%s', role: %s, working at %s. "+
 			"Use send_message to communicate with the lead or other teammates. "+
 			"Use read_inbox when you need to inspect unread messages. "+
+			"If a task is risky, destructive, or a broad refactor, submit plan_approval and wait for plan_approval_response before changing files. "+
+			"If the lead sends shutdown_request, respond with shutdown_response before ending your run. "+
 			"Complete the assigned task with the available tools.",
 		name,
 		role,
@@ -475,6 +616,7 @@ func validMessageTypeValues() []string {
 		msgTypeBroadcast,
 		msgTypeShutdownRequest,
 		msgTypeShutdownResponse,
+		msgTypePlanApprovalRequest,
 		msgTypePlanApprovalResponse,
 	}
 }
@@ -514,6 +656,50 @@ func (tm *TeammateManager) teammateToolDefinitions() []toolSpec {
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "shutdown_response",
+			Description: "Respond to a shutdown request from the lead. Approve to shut down gracefully, reject to keep working.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"request_id": map[string]any{
+						"type":        "string",
+						"description": "The request_id from the shutdown_request message",
+					},
+					"approve": map[string]any{
+						"type":        "boolean",
+						"description": "true to approve shutdown, false to reject",
+					},
+					"reason": map[string]any{
+						"type":        "string",
+						"description": "Optional reason for the decision",
+					},
+				},
+				"required": []string{"request_id", "approve"},
+			},
+		},
+	})
+
+	tools = append(tools, toolSpec{
+		Type: "function",
+		Function: toolFunction{
+			Name:        "plan_approval",
+			Description: "Submit a plan for lead approval before doing major work.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"plan": map[string]any{
+						"type":        "string",
+						"description": "The plan text to submit for approval",
+					},
+				},
+				"required": []string{"plan"},
 			},
 		},
 	})
@@ -570,7 +756,21 @@ func (tm *TeammateManager) execTeammateTool(cfg config, sender string, call tool
 			msgType = msgTypeMessage
 		}
 
-		return tm.bus.Send(sender, input.To, msgType, input.Content, nil)
+		extra := map[string]any(nil)
+		switch msgType {
+		case msgTypePlanApprovalRequest:
+			reqID := generateRequestID()
+			trackPlanRequest(reqID, sender, input.Content)
+			extra = map[string]any{"request_id": reqID}
+		}
+
+		result := tm.bus.Send(sender, input.To, msgType, input.Content, extra)
+		if input.To != "lead" {
+			if err := tm.Wake(cfg, input.To); err != nil {
+				return fmt.Sprintf("%s (wake %s: %v)", result, input.To, err)
+			}
+		}
+		return result
 
 	case "read_inbox":
 		msgs, err := tm.bus.ReadInbox(sender)
@@ -584,6 +784,50 @@ func (tm *TeammateManager) execTeammateTool(cfg config, sender string, call tool
 		}
 		return string(data)
 
+	case "shutdown_response":
+		var input struct {
+			RequestID string `json:"request_id"`
+			Approve   bool   `json:"approve"`
+			Reason    string `json:"reason,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		newStatus := statusRejected
+		if input.Approve {
+			newStatus = statusApproved
+			tm.setNextStatus(sender, teammateStatusShutdown)
+		}
+		updateShutdownRequest(input.RequestID, newStatus)
+
+		extra := map[string]any{
+			"request_id": input.RequestID,
+			"approve":    input.Approve,
+		}
+		reason := input.Reason
+		if reason == "" {
+			reason = fmt.Sprintf("Shutdown %s", newStatus)
+		}
+
+		return tm.bus.Send(sender, "lead", msgTypeShutdownResponse, reason, extra)
+
+	case "plan_approval":
+		var input struct {
+			Plan string `json:"plan"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			return fmt.Sprintf("invalid tool arguments: %v", err)
+		}
+
+		reqID := generateRequestID()
+		trackPlanRequest(reqID, sender, input.Plan)
+
+		extra := map[string]any{
+			"request_id": reqID,
+		}
+		sendResult := tm.bus.Send(sender, "lead", msgTypePlanApprovalRequest, input.Plan, extra)
+		return fmt.Sprintf("%s (request_id=%s). Wait for a plan_approval_response before proceeding with risky work.", sendResult, reqID)
 	default:
 		return fmt.Sprintf("unsupported teammate tool: %s", call.Function.Name)
 	}
@@ -623,6 +867,153 @@ func (tm *TeammateManager) finishRun(name string, nextStatus string) error {
 
 	member.Status = nextStatus
 	tm.running[name] = false
+	delete(tm.nextStatus, name)
 
 	return tm.saveConfig()
+}
+
+func (tm *TeammateManager) setNextStatus(name, status string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.nextStatus[name] = status
+}
+
+func (tm *TeammateManager) consumeNextStatus(name, fallback string) string {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	status, ok := tm.nextStatus[name]
+	if !ok || strings.TrimSpace(status) == "" {
+		return fallback
+	}
+
+	delete(tm.nextStatus, name)
+	return status
+}
+
+func generateRequestID() string {
+	return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+}
+
+func trackShutdownRequest(reqID string, from string) {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	shutdownRequests[reqID] = &ProtocolRequest{
+		RequestID: reqID,
+		From:      from,
+		Status:    statusPending,
+	}
+}
+
+func updateShutdownRequest(reqID string, newStatus string) bool {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	if req, exists := shutdownRequests[reqID]; exists {
+		req.Status = newStatus
+		return true
+	}
+	return false
+}
+
+func getShutdownRequest(reqID string) *ProtocolRequest {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	return shutdownRequests[reqID]
+}
+
+func trackPlanRequest(reqID string, from string, plan string) {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	planRequests[reqID] = &ProtocolRequest{
+		RequestID: reqID,
+		From:      from,
+		Status:    statusPending,
+		Payload:   plan,
+	}
+}
+
+func getPlanRequest(reqID string) *ProtocolRequest {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	return planRequests[reqID]
+}
+
+func updatePlanRequest(reqID string, newStatus string) bool {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	if req, exists := planRequests[reqID]; exists {
+		req.Status = newStatus
+		return true
+	}
+	return false
+}
+
+func listPendingPlanRequests() []ProtocolRequest {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	result := make([]ProtocolRequest, 0)
+	for _, req := range planRequests {
+		if req.Status == statusPending {
+			result = append(result, *req)
+		}
+	}
+	return result
+}
+
+func handleShutdownRequest(cfg config, teammate string) string {
+	member, err := teammateManager.GetMember(teammate)
+	if err != nil {
+		return err.Error()
+	}
+
+	reqID := generateRequestID()
+	trackShutdownRequest(reqID, teammate)
+
+	extra := map[string]any{
+		"request_id": reqID,
+	}
+	result := teamBus.Send("lead", teammate, msgTypeShutdownRequest, "Please shut down gracefully.", extra)
+
+	if member.Status == teammateStatusIdle && !teammateManager.IsRunning(teammate) {
+		updateShutdownRequest(reqID, statusApproved)
+		if _, setErr := teammateManager.SetStatus(teammate, teammateStatusShutdown); setErr != nil {
+			return fmt.Sprintf("%s (auto-shutdown status update failed: %v)", result, setErr)
+		}
+		_ = teamBus.Send(teammate, "lead", msgTypeShutdownResponse, "Shutdown approved while idle.", map[string]any{
+			"request_id": reqID,
+			"approve":    true,
+		})
+		return fmt.Sprintf("%s (auto-approved while idle)", result)
+	}
+
+	if err := teammateManager.Wake(cfg, teammate); err != nil {
+		return fmt.Sprintf("%s (wake %s: %v)", result, teammate, err)
+	}
+
+	return result
+}
+
+func handlePlanReview(cfg config, requestID string, approve bool, feedback string) string {
+	req := getPlanRequest(requestID)
+	if req == nil {
+		return fmt.Sprintf("error: unknown plan request_id %q", requestID)
+	}
+
+	newStatus := statusApproved
+	if !approve {
+		newStatus = statusRejected
+	}
+	updatePlanRequest(requestID, newStatus)
+
+	extra := map[string]any{
+		"request_id": requestID,
+		"approve":    approve,
+		"feedback":   feedback,
+	}
+	sendResult := teamBus.Send("lead", req.From, msgTypePlanApprovalResponse, feedback, extra)
+	if err := teammateManager.Wake(cfg, req.From); err != nil {
+		return fmt.Sprintf("plan %s for %s (%s; wake error: %v)", newStatus, req.From, sendResult, err)
+	}
+
+	return fmt.Sprintf("plan %s for %s (%s)", newStatus, req.From, sendResult)
 }
